@@ -11,23 +11,32 @@ checking, projection, and ill-formed subtrees.
 
 - Create lexical items with:
   - a spelling
-  - one category feature: `N`, `V`, `A`, or `P`
-  - any number of uninterpretable features: `uN`, `uV`, `uA`, or `uP`
+  - one category feature: `N`, `V`, `v`, `A`, or `P`
+  - any number of uninterpretable features: `uN`, `uV`, `uv`, `uA`, or `uP`
 - Drag lexical items and trees freely around the canvas.
+- Remove any top-level lexical item or tree by dragging it onto the trash zone.
+- Undo the most recent removal from the bottom notification.
 - Merge a pair when one expression has an unchecked `uX` feature and the other
   expression has category `X`.
 - Display checked features with a strikethrough.
 - Determine the head from the expression whose uninterpretable feature is
   checked.
+- Linearize daughters with the current internal Head Initial setting.
+- Enforce the Hierarchy of Projection for `v`: a `v` head must first merge
+  with a VP complement before checking another c-selectional feature.
 - Project the head category to the mother node.
 - Label projections as:
-  - `XP` when the head has no unchecked uninterpretable features
-  - `X′` when unchecked uninterpretable features remain
+  - `X′` when some c-selectional features have been checked but others remain
+    unchecked
+  - `XP` when all c-selectional features have been checked
 - Merge lexical items with trees, or trees with other trees.
 - Mark a non-head daughter red when it retains an unchecked uninterpretable
   feature.
-- Detach a leaf or a root daughter and undo the feature check introduced by
-  that Merge operation.
+- Check every top-level structure for Full Interpretation. A structure satisfies
+  Full Interpretation when no active uninterpretable feature remains anywhere
+  in its lexical leaves.
+- Detach one of the current root node's two daughters and undo the feature
+  check introduced by that Merge operation.
 - Show a circular drop indicator when the dragged expression is within Merge
   range of a compatible target.
 
@@ -66,6 +75,61 @@ because `letters` has an unchecked `uP` feature and the tree projects category
 Merge is rejected when neither expression has an unchecked feature matching the
 other expression's category.
 
+## Full Interpretation
+
+Each top-level expression on the canvas is checked recursively before it reaches
+the conceptual semantic interface:
+
+- **Full Interpretation** means that no active uninterpretable feature remains.
+- **Uninterpretable: ...** lists features that are still unchecked.
+
+Features carry explicit `interpretable` and `kind` metadata internally. The
+current UI creates category features as interpretable and c-selectional
+features as uninterpretable. This model allows future uninterpretable feature
+types to participate in Full Interpretation without relying on a `u` naming
+prefix.
+
+## Linearization
+
+The application currently uses **Head Initial** linearization:
+
+- the first Merge with a lexical head introduces a **Complement**, placed to
+  the right of the head;
+- a Merge with an already projected head introduces a **Specifier**, placed to
+  the left of the projection.
+
+This distinction is structural and does not depend on whether the previous
+Merge checked a c-selectional feature. Consequently, Hierarchy of Projection
+can license `v + VP` without `uV`. If `v` still has another unchecked
+c-selectional feature, the result is `v′`, and the next feature-checking Merge
+targets that projection and introduces a left-side Specifier.
+
+Projection labels are calculated separately from the Complement/Specifier
+distinction. A head with any unchecked c-selectional feature projects `X′`;
+once all of its c-selectional features are checked, it projects `XP`.
+
+Head Final behavior remains represented internally for future use, but is not
+currently exposed as a user setting.
+
+## Hierarchy of Projection
+
+The category inventory includes lowercase `v`. A `v` head must contain a
+category `V` projection as its complement before one of its other
+c-selectional features can be checked.
+
+Hierarchy of Projection independently licenses Merge between `v` and a VP.
+Therefore, `v` can take a VP complement even when it has no `uV` feature. If
+`uV` is present, ordinary feature checking can license the same Merge.
+
+If another c-selectional feature such as `uN` is checked before that VP
+complement is present, Merge still applies, but the violating `v` subtree is
+displayed in red.
+
+The application also displays warning notifications when:
+
+- a non-head still contains an unchecked c-selectional feature;
+- `v` violates the Hierarchy of Projection.
+
 ## Using the application
 
 1. Start the development server and open the application.
@@ -75,8 +139,10 @@ other expression's category.
 5. When a translucent green circle and **Release to Merge** appear, release the
    pointer to Merge them.
 6. Drag the resulting tree to use it in another Merge operation.
-7. Hover over a detachable leaf or root daughter and select its `×` button to
-   separate it from the tree.
+7. Hover over either daughter immediately below the root and select its `×`
+   button to separate it from the tree.
+8. Drag a top-level item or tree onto the trash zone and release it to remove
+   it from the canvas.
 
 The initial canvas contains:
 

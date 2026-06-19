@@ -8,12 +8,18 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 
-type Category = "N" | "V" | "A" | "P";
+type Category = "N" | "V" | "v" | "A" | "P";
 type UninterpretableFeature = `u${Category}`;
+type FeatureKind = "category" | "c-selectional" | "other";
+type Linearization = "head-initial" | "head-final";
+type IllFormedReason = "unchecked-non-head" | "hierarchy-of-projection";
+type MergeRelation = "complement" | "specifier";
 
 type Feature = {
-  value: Category | UninterpretableFeature;
+  value: string;
   checked: boolean;
+  interpretable: boolean;
+  kind: FeatureKind;
 };
 
 type SyntaxNode = {
@@ -26,9 +32,12 @@ type SyntaxNode = {
   children?: SyntaxNode[];
   headChildId?: string;
   checkedFeature?: UninterpretableFeature;
+  violationsIntroduced?: IllFormedReason[];
+  mergeRelation?: MergeRelation;
   x: number;
   y: number;
   illFormed?: boolean;
+  illFormedReasons?: IllFormedReason[];
 };
 
 type TreeLayoutNode = {
@@ -43,19 +52,34 @@ type TreeLayoutNode = {
 type MergeCandidate = {
   node: SyntaxNode;
   isValid: boolean;
+  radius: number;
 };
 
-const CATEGORIES: Category[] = ["N", "V", "A", "P"];
+type DeletedNode = {
+  node: SyntaxNode;
+  index: number;
+};
+
+type MergeResult = {
+  node: SyntaxNode;
+  warnings: string[];
+};
+
+const CATEGORIES: Category[] = ["N", "V", "v", "A", "P"];
 const UNINTERPRETABLE_FEATURES: UninterpretableFeature[] = [
   "uN",
   "uV",
+  "uv",
   "uA",
   "uP",
 ];
-const LEAF_WIDTH = 170;
 const LEVEL_HEIGHT = 78;
-const MERGE_RADIUS = 80;
-const SIBLING_GAP = 28;
+// Keep only enough space between sister subtrees for one 24px detach control.
+const DETACH_GAP = 28;
+const MIN_LABEL_WIDTH = 54;
+const MAX_LABEL_WIDTH = 240;
+const TRASH_ZONE_SIZE = 76;
+const TRASH_ZONE_MARGIN = 28;
 
 const initialNodes: SyntaxNode[] = [
   {
@@ -64,11 +88,21 @@ const initialNodes: SyntaxNode[] = [
     spelling: "letters",
     category: "N",
     features: [
-      { value: "N", checked: false },
-      { value: "uP", checked: false },
+      {
+        value: "N",
+        checked: false,
+        interpretable: true,
+        kind: "category",
+      },
+      {
+        value: "uP",
+        checked: false,
+        interpretable: false,
+        kind: "c-selectional",
+      },
     ],
-    x: 120,
-    y: 210,
+    x: 140,
+    y: 220,
   },
   {
     id: "to",
@@ -76,20 +110,37 @@ const initialNodes: SyntaxNode[] = [
     spelling: "to",
     category: "P",
     features: [
-      { value: "P", checked: false },
-      { value: "uN", checked: false },
+      {
+        value: "P",
+        checked: false,
+        interpretable: true,
+        kind: "category",
+      },
+      {
+        value: "uN",
+        checked: false,
+        interpretable: false,
+        kind: "c-selectional",
+      },
     ],
-    x: 430,
-    y: 390,
+    x: 390,
+    y: 220,
   },
   {
     id: "peter",
     type: "lexical",
     spelling: "Peter",
     category: "N",
-    features: [{ value: "N", checked: false }],
-    x: 720,
-    y: 390,
+    features: [
+      {
+        value: "N",
+        checked: false,
+        interpretable: true,
+        kind: "category",
+      },
+    ],
+    x: 640,
+    y: 220,
   },
 ];
 
@@ -98,14 +149,28 @@ function treeDepth(node: SyntaxNode): number {
   return 1 + Math.max(...node.children.map(treeDepth));
 }
 
+function getNodeLabelWidth(node: SyntaxNode): number {
+  if (node.type === "merged") {
+    return Math.max(MIN_LABEL_WIDTH, (node.label?.length ?? 2) * 11 + 18);
+  }
+
+  const featureText = node.features.map((feature) => feature.value).join(", ");
+  const text = `${node.spelling ?? ""} [${featureText}]`;
+  return Math.min(
+    MAX_LABEL_WIDTH,
+    Math.max(MIN_LABEL_WIDTH, text.length * 7.4 + 18),
+  );
+}
+
 function getTreeHalfWidth(node: SyntaxNode): number {
-  if (!node.children?.length) return LEAF_WIDTH / 2;
+  const labelHalf = getNodeLabelWidth(node) / 2;
+  if (!node.children?.length) return labelHalf;
   const [left, right] = node.children;
   const leftHalf = getTreeHalfWidth(left);
   const rightHalf = getTreeHalfWidth(right);
-  const childOffset = (leftHalf + rightHalf) / 2 + SIBLING_GAP;
+  const childOffset = (leftHalf + rightHalf + DETACH_GAP) / 2;
   return Math.max(
-    LEAF_WIDTH / 2,
+    labelHalf,
     childOffset + leftHalf,
     childOffset + rightHalf,
   );
@@ -118,15 +183,82 @@ function getNodeSize(node: SyntaxNode) {
   };
 }
 
+function isActiveUninterpretableFeature(feature: Feature) {
+  return !feature.interpretable && !feature.checked;
+}
+
 function hasUncheckedFeature(node: SyntaxNode) {
   return node.features.some(
-    (feature) => feature.value.startsWith("u") && !feature.checked,
+    isActiveUninterpretableFeature,
+  );
+}
+
+function hasUncheckedCSelectionalFeature(node: SyntaxNode) {
+  return node.features.some(
+    (feature) =>
+      feature.kind === "c-selectional" &&
+      !feature.interpretable &&
+      !feature.checked,
   );
 }
 
 function subtreeHasUncheckedFeature(node: SyntaxNode): boolean {
   if (hasUncheckedFeature(node)) return true;
   return node.children?.some(subtreeHasUncheckedFeature) ?? false;
+}
+
+function getActiveUninterpretableFeatures(node: SyntaxNode): Feature[] {
+  // Merged nodes project their head's features, so inspect lexical leaves to
+  // avoid counting the same projected feature more than once.
+  if (node.type === "lexical" || !node.children?.length) {
+    return node.features.filter(isActiveUninterpretableFeature);
+  }
+  return node.children.flatMap(getActiveUninterpretableFeatures);
+}
+
+function getActiveCSelectionalFeatures(node: SyntaxNode): Feature[] {
+  return getActiveUninterpretableFeatures(node).filter(
+    (feature) => feature.kind === "c-selectional",
+  );
+}
+
+function markIllFormed(
+  node: SyntaxNode,
+  reason: IllFormedReason,
+): SyntaxNode {
+  return {
+    ...node,
+    illFormed: true,
+    illFormedReasons: Array.from(
+      new Set([...(node.illFormedReasons ?? []), reason]),
+    ),
+  };
+}
+
+function clearIllFormedReason(
+  node: SyntaxNode,
+  reason: IllFormedReason,
+): SyntaxNode {
+  const reasons = (node.illFormedReasons ?? []).filter(
+    (current) => current !== reason,
+  );
+  return {
+    ...node,
+    illFormed: reasons.length > 0,
+    illFormedReasons: reasons,
+  };
+}
+
+function hasVPComplement(node: SyntaxNode): boolean {
+  if (node.category !== "v" || !node.children || !node.headChildId) {
+    return false;
+  }
+
+  const nonHead = node.children.find((child) => child.id !== node.headChildId);
+  if (nonHead?.category === "V") return true;
+
+  const head = node.children.find((child) => child.id === node.headChildId);
+  return head ? hasVPComplement(head) : false;
 }
 
 function checkHeadFeature(
@@ -197,60 +329,134 @@ function findHeadCandidate(
 ): UninterpretableFeature | null {
   const expected = `u${complement.category}` as UninterpretableFeature;
   const match = possibleHead.features.find(
-    (feature) => feature.value === expected && !feature.checked,
+    (feature) =>
+      feature.kind === "c-selectional" &&
+      !feature.interpretable &&
+      feature.value === expected &&
+      !feature.checked,
   );
   return match ? expected : null;
+}
+
+function isHierarchyOfProjectionMerge(
+  possibleHead: SyntaxNode,
+  complement: SyntaxNode,
+) {
+  return (
+    possibleHead.category === "v" &&
+    complement.category === "V" &&
+    !hasVPComplement(possibleHead)
+  );
+}
+
+function classifyMergeRelation(head: SyntaxNode): MergeRelation {
+  // The first Merge with a lexical head introduces its complement.
+  // Any later Merge targets an already projected head and introduces a specifier.
+  return head.type === "lexical" ? "complement" : "specifier";
 }
 
 function createMerge(
   first: SyntaxNode,
   second: SyntaxNode,
-): SyntaxNode | null {
+  linearization: Linearization,
+): MergeResult | null {
   // The moving item is considered first only to resolve the rare case where
   // both daughters can select each other; either direction is otherwise valid.
   const firstMatch = findHeadCandidate(first, second);
   const secondMatch = findHeadCandidate(second, first);
-  const head = firstMatch ? first : secondMatch ? second : null;
+  const hierarchyHead = isHierarchyOfProjectionMerge(first, second)
+    ? first
+    : isHierarchyOfProjectionMerge(second, first)
+      ? second
+      : null;
+  const head = firstMatch ? first : secondMatch ? second : hierarchyHead;
   const checkedValue = firstMatch ?? secondMatch;
 
-  if (!head || !checkedValue) return null;
+  if (!head) return null;
 
   const nonHead = head.id === first.id ? second : first;
-  const checkedHead = checkHeadFeature(head, checkedValue);
+  const isHierarchyMerge = hierarchyHead?.id === head.id && !checkedValue;
+  const mergeRelation = classifyMergeRelation(head);
+  const activeNonHeadSelection = getActiveCSelectionalFeatures(nonHead);
+  const violatesHierarchy =
+    head.category === "v" &&
+    !isHierarchyMerge &&
+    checkedValue !== "uV" &&
+    !hasVPComplement(head);
+  const checkedHeadBase = checkedValue
+    ? checkHeadFeature(head, checkedValue)
+    : head;
+  const checkedHead = violatesHierarchy
+    ? markIllFormed(checkedHeadBase, "hierarchy-of-projection")
+    : checkedHeadBase;
   const markedNonHead = subtreeHasUncheckedFeature(nonHead)
-    ? { ...nonHead, illFormed: true }
+    ? markIllFormed(nonHead, "unchecked-non-head")
     : nonHead;
-  const hasRemainingSelection = hasUncheckedFeature(checkedHead);
-  const label = hasRemainingSelection
+  const label = hasUncheckedCSelectionalFeature(checkedHead)
     ? `${checkedHead.category}′`
     : `${checkedHead.category}P`;
-  const firstChild = head.id === first.id ? checkedHead : markedNonHead;
-  const secondChild = head.id === second.id ? checkedHead : markedNonHead;
-  const firstCenterX = first.x + getNodeSize(first).width / 2;
-  const secondCenterX = second.x + getNodeSize(second).width / 2;
+  // Head Initial places complements to the right and specifiers to the left.
+  // Head Final reverses both. Projection status, not checking history,
+  // determines which relation the new non-head bears.
+  const nonHeadGoesRight =
+    linearization === "head-initial"
+      ? mergeRelation === "complement"
+      : mergeRelation === "specifier";
+  const children = nonHeadGoesRight
+    ? [checkedHead, markedNonHead]
+    : [markedNonHead, checkedHead];
+
+  const warnings: string[] = [];
+  if (activeNonHeadSelection.length > 0) {
+    warnings.push(
+      `Non-head warning: unchecked c-selectional feature(s) remain: ${activeNonHeadSelection
+        .map((feature) => feature.value)
+        .join(", ")}.`,
+    );
+  }
+  if (violatesHierarchy) {
+    warnings.push(
+      "Hierarchy of Projection warning: v must merge with a VP complement before another c-selectional feature is checked.",
+    );
+  }
 
   return {
-    id: crypto.randomUUID(),
-    type: "merged",
-    category: checkedHead.category,
-    // A merged node projects the head's features for later Merge operations.
-    features: checkedHead.features.map((feature) => ({ ...feature })),
-    label,
-    // Preserve the daughters' left-to-right relation at the moment of Merge.
-    children:
-      firstCenterX <= secondCenterX
-        ? [firstChild, secondChild]
-        : [secondChild, firstChild],
-    headChildId: checkedHead.id,
-    checkedFeature: checkedValue,
-    x: 0,
-    y: 0,
+    node: {
+      id: crypto.randomUUID(),
+      type: "merged",
+      category: checkedHead.category,
+      // A merged node projects the head's features for later Merge operations.
+      features: checkedHead.features.map((feature) => ({ ...feature })),
+      label,
+      children,
+      headChildId: checkedHead.id,
+      checkedFeature: checkedValue ?? undefined,
+      mergeRelation,
+      violationsIntroduced: violatesHierarchy
+        ? ["hierarchy-of-projection"]
+        : [],
+      x: 0,
+      y: 0,
+    },
+    warnings,
   };
 }
 
 function canMerge(first: SyntaxNode, second: SyntaxNode) {
   return Boolean(
-    findHeadCandidate(first, second) || findHeadCandidate(second, first),
+    findHeadCandidate(first, second) ||
+      findHeadCandidate(second, first) ||
+      isHierarchyOfProjectionMerge(first, second) ||
+      isHierarchyOfProjectionMerge(second, first),
+  );
+}
+
+function getMergeRadius(first: SyntaxNode, second: SyntaxNode) {
+  // This equals the distance between the two daughter roots after Merge.
+  return (
+    getTreeHalfWidth(first) +
+    getTreeHalfWidth(second) +
+    DETACH_GAP
   );
 }
 
@@ -276,12 +482,19 @@ function findMergeCandidate(
         movingCenter.x - center.x,
         movingCenter.y - center.y,
       );
-      return { node, distance };
+      const radius = getMergeRadius(moving, node);
+      return { node, distance, radius };
     })
-    .filter((candidate) => candidate.distance <= MERGE_RADIUS)
+    .filter((candidate) => candidate.distance <= candidate.radius)
     .sort((a, b) => a.distance - b.distance)[0]?.node;
 
-  return target ? { node: target, isValid: canMerge(moving, target) } : null;
+  return target
+    ? {
+        node: target,
+        isValid: canMerge(moving, target),
+        radius: getMergeRadius(moving, target),
+      }
+    : null;
 }
 
 function positionMergedFromStationaryDaughter(
@@ -309,7 +522,14 @@ function positionMergedFromStationaryDaughter(
 }
 
 function clearRootIllFormed(node: SyntaxNode): SyntaxNode {
-  return { ...node, illFormed: false };
+  const reasons = (node.illFormedReasons ?? []).filter(
+    (reason) => reason !== "unchecked-non-head",
+  );
+  return {
+    ...node,
+    illFormed: reasons.length > 0,
+    illFormedReasons: reasons,
+  };
 }
 
 function refreshMergedNode(node: SyntaxNode): SyntaxNode {
@@ -322,17 +542,22 @@ function refreshMergedNode(node: SyntaxNode): SyntaxNode {
   if (!head) return clearRootIllFormed(node);
   const children = refreshedChildren.map((child) =>
     child.id !== head.id && subtreeHasUncheckedFeature(child)
-      ? { ...child, illFormed: true }
-      : child,
+      ? markIllFormed(child, "unchecked-non-head")
+      : clearRootIllFormed(child),
   );
 
   return {
     ...node,
     category: head.category,
     features: head.features.map((feature) => ({ ...feature })),
-    label: hasUncheckedFeature(head) ? `${head.category}′` : `${head.category}P`,
+    label: hasUncheckedCSelectionalFeature(head)
+      ? `${head.category}′`
+      : `${head.category}P`,
     children,
-    illFormed: false,
+    illFormed: node.illFormedReasons?.includes("hierarchy-of-projection"),
+    illFormedReasons: node.illFormedReasons?.filter(
+      (reason) => reason === "hierarchy-of-projection",
+    ),
   };
 }
 
@@ -340,42 +565,38 @@ function detachNode(
   root: SyntaxNode,
   targetId: string,
 ): { remaining: SyntaxNode; detached: SyntaxNode } | null {
-  if (!root.children || !root.checkedFeature || !root.headChildId) return null;
+  if (!root.children || !root.headChildId) return null;
   const directIndex = root.children.findIndex((child) => child.id === targetId);
 
-  if (directIndex >= 0) {
-    const selected = clearRootIllFormed(root.children[directIndex]);
-    const sibling = root.children[directIndex === 0 ? 1 : 0];
-    const detached =
-      selected.id === root.headChildId
-        ? uncheckHeadFeature(selected, root.checkedFeature)
-        : selected;
-    const remaining =
-      sibling.id === root.headChildId
-        ? uncheckHeadFeature(sibling, root.checkedFeature)
-        : sibling;
-    return {
-      remaining: refreshMergedNode(clearRootIllFormed(remaining)),
-      detached: refreshMergedNode(detached),
-    };
-  }
+  if (directIndex < 0) return null;
 
-  for (const child of root.children) {
-    const result = detachNode(child, targetId);
-    if (!result) continue;
-    const children = root.children.map((current) =>
-      current.id === child.id ? result.remaining : current,
-    );
-    const rebuilt = refreshMergedNode({
-      ...root,
-      children,
-      headChildId:
-        root.headChildId === child.id ? result.remaining.id : root.headChildId,
-    });
-    return { remaining: rebuilt, detached: result.detached };
+  const selected = clearRootIllFormed(root.children[directIndex]);
+  const sibling = root.children[directIndex === 0 ? 1 : 0];
+  let detached =
+    selected.id === root.headChildId && root.checkedFeature
+      ? uncheckHeadFeature(selected, root.checkedFeature)
+      : selected;
+  let remaining =
+    sibling.id === root.headChildId && root.checkedFeature
+      ? uncheckHeadFeature(sibling, root.checkedFeature)
+      : sibling;
+  if (
+    root.violationsIntroduced?.includes("hierarchy-of-projection")
+  ) {
+    if (sibling.id === root.headChildId) {
+      remaining = clearIllFormedReason(
+        remaining,
+        "hierarchy-of-projection",
+      );
+    }
+    if (selected.id === root.headChildId) {
+      detached = clearIllFormedReason(detached, "hierarchy-of-projection");
+    }
   }
-
-  return null;
+  return {
+    remaining: refreshMergedNode(clearRootIllFormed(remaining)),
+    detached: refreshMergedNode(detached),
+  };
 }
 
 function buildTreeLayout(node: SyntaxNode, width: number): TreeLayoutNode[] {
@@ -404,7 +625,7 @@ function buildTreeLayout(node: SyntaxNode, width: number): TreeLayoutNode[] {
     if (current.children?.length === 2) {
       const [left, right] = current.children;
       const childOffset =
-        (getTreeHalfWidth(left) + getTreeHalfWidth(right)) / 2 + SIBLING_GAP;
+        (getTreeHalfWidth(left) + getTreeHalfWidth(right) + DETACH_GAP) / 2;
       current.children.forEach((child, index) => {
         visit(
           child,
@@ -496,48 +717,41 @@ function SyntaxTree({
             />
           ),
       )}
-      {layout.map((item) => (
-        <foreignObject
-          key={item.node.id}
-          x={item.x - LEAF_WIDTH / 2}
-          y={item.y - 22}
-          width={LEAF_WIDTH}
-          height={48}
-        >
-          <TreeNodeContent
-            node={item.node}
-            illFormed={item.inheritedIllFormed}
-          />
-        </foreignObject>
-      ))}
       {layout.map((item) => {
-        const isLeaf = !item.node.children?.length;
-        const canDetach =
-          item.node.id !== node.id &&
-          (isLeaf || rootChildIds.has(item.node.id));
-        if (!canDetach) return null;
-
+        const labelWidth = getNodeLabelWidth(item.node);
+        const canDetach = rootChildIds.has(item.node.id);
         return (
           <foreignObject
-            key={`detach-${item.node.id}`}
-            className="detach-control"
-            x={item.x + 44}
-            y={item.y - 16}
-            width={28}
-            height={28}
+            key={item.node.id}
+            x={item.x - labelWidth / 2}
+            y={item.y - 22}
+            width={labelWidth + (canDetach ? 32 : 0)}
+            height={48}
+            className={canDetach ? "detachable-label" : undefined}
           >
-            <button
-              type="button"
-              aria-label={`Detach ${item.node.label ?? item.node.spelling}`}
-              title="Detach"
-              onPointerDown={(event) => event.stopPropagation()}
-              onClick={(event) => {
-                event.stopPropagation();
-                onDetach(item.node.id);
-              }}
-            >
-              <CrossIcon />
-            </button>
+            <div className="node-label-row">
+              <div style={{ width: labelWidth }}>
+                <TreeNodeContent
+                  node={item.node}
+                  illFormed={item.inheritedIllFormed}
+                />
+              </div>
+              {canDetach && (
+                <button
+                  className="detach-control"
+                  type="button"
+                  aria-label={`Detach ${item.node.label ?? item.node.spelling}`}
+                  title="Detach"
+                  onPointerDown={(event) => event.stopPropagation()}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onDetach(item.node.id);
+                  }}
+                >
+                  <CrossIcon />
+                </button>
+              )}
+            </div>
           </foreignObject>
         );
       })}
@@ -561,17 +775,30 @@ function PlusIcon() {
   );
 }
 
+function TrashIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M3 4h10M6 2.5h4M5 6v6M8 6v6M11 6v6M4 4l.6 9.5h6.8L12 4" />
+    </svg>
+  );
+}
+
 export default function MergeWorkspace() {
   const [nodes, setNodes] = useState<SyntaxNode[]>(initialNodes);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  // Kept as an explicit internal option so Head Final can be exposed later.
+  const linearization: Linearization = "head-initial";
   const [spelling, setSpelling] = useState("");
   const [category, setCategory] = useState<Category>("N");
   const [extraFeatures, setExtraFeatures] = useState<
     UninterpretableFeature[]
   >([]);
   const [message, setMessage] = useState<string | null>(null);
+  const [lastDeleted, setLastDeleted] = useState<DeletedNode | null>(null);
   const [mergeCandidate, setMergeCandidate] =
     useState<MergeCandidate | null>(null);
+  const [draggingNodeId, setDraggingNodeId] = useState<string | null>(null);
+  const [isOverTrash, setIsOverTrash] = useState(false);
   const canvasRef = useRef<HTMLDivElement>(null);
   const nodesRef = useRef(nodes);
   const dragRef = useRef<{
@@ -587,13 +814,33 @@ export default function MergeWorkspace() {
 
   useEffect(() => {
     if (!message) return;
-    const timeout = window.setTimeout(() => setMessage(null), 2200);
+    const isDeleteMessage =
+      lastDeleted &&
+      message ===
+        `${lastDeleted.node.label ?? lastDeleted.node.spelling} removed from the canvas.`;
+    const timeout = window.setTimeout(() => {
+      setMessage(null);
+      setLastDeleted(null);
+    }, isDeleteMessage || message.includes("warning:") ? 6000 : 2200);
     return () => window.clearTimeout(timeout);
-  }, [message]);
+  }, [lastDeleted, message]);
 
   function updateNodes(next: SyntaxNode[]) {
     nodesRef.current = next;
     setNodes(next);
+  }
+
+  function isPointerOverTrash(clientX: number, clientY: number) {
+    if (!canvasRef.current) return false;
+    const canvasRect = canvasRef.current.getBoundingClientRect();
+    const x = clientX - canvasRect.left;
+    const y = clientY - canvasRect.top;
+    return (
+      x >= canvasRect.width - TRASH_ZONE_MARGIN - TRASH_ZONE_SIZE &&
+      x <= canvasRect.width - TRASH_ZONE_MARGIN &&
+      y >= canvasRect.height - TRASH_ZONE_MARGIN - TRASH_ZONE_SIZE &&
+      y <= canvasRect.height - TRASH_ZONE_MARGIN
+    );
   }
 
   function handlePointerDown(
@@ -610,6 +857,8 @@ export default function MergeWorkspace() {
     };
     event.currentTarget.setPointerCapture(event.pointerId);
     event.currentTarget.classList.add("dragging");
+    setDraggingNodeId(node.id);
+    setIsOverTrash(false);
     setMergeCandidate(null);
   }
 
@@ -642,8 +891,12 @@ export default function MergeWorkspace() {
     );
     updateNodes(nextNodes);
     const nextMovingNode = nextNodes.find((node) => node.id === drag.id);
+    const overTrash = isPointerOverTrash(event.clientX, event.clientY);
+    setIsOverTrash(overTrash);
     setMergeCandidate(
-      nextMovingNode ? findMergeCandidate(nextNodes, nextMovingNode) : null,
+      !overTrash && nextMovingNode
+        ? findMergeCandidate(nextNodes, nextMovingNode)
+        : null,
     );
   }
 
@@ -654,16 +907,24 @@ export default function MergeWorkspace() {
     event.currentTarget.classList.remove("dragging");
     const currentNodes = nodesRef.current;
     const moving = currentNodes.find((node) => node.id === drag.id);
+    const droppedOnTrash = isPointerOverTrash(event.clientX, event.clientY);
     dragRef.current = null;
+    setDraggingNodeId(null);
+    setIsOverTrash(false);
     setMergeCandidate(null);
     if (!moving) return;
+
+    if (droppedOnTrash) {
+      handleDelete(moving.id);
+      return;
+    }
 
     const candidate = findMergeCandidate(currentNodes, moving);
     const target = candidate?.node;
 
     if (!target) return;
 
-    const mergeResult = createMerge(moving, target);
+    const mergeResult = createMerge(moving, target, linearization);
 
     if (!mergeResult) {
       setMessage(
@@ -672,38 +933,49 @@ export default function MergeWorkspace() {
       return;
     }
 
-    const merged = positionMergedFromStationaryDaughter(mergeResult, target);
+    const merged = positionMergedFromStationaryDaughter(
+      mergeResult.node,
+      target,
+    );
     updateNodes([
       ...currentNodes.filter(
         (node) => node.id !== moving.id && node.id !== target.id,
       ),
       merged,
     ]);
-    setMessage(`${merged.label}: Merge successful`);
+    setMessage(
+      mergeResult.warnings.length > 0
+        ? mergeResult.warnings.join(" ")
+        : `${merged.label}: Merge successful`,
+    );
   }
 
   function handleDetach(root: SyntaxNode, targetId: string) {
+    const originalSize = getNodeSize(root);
+    const originalPositions = new Map(
+      buildTreeLayout(root, originalSize.width).map((item) => [
+        item.node.id,
+        {
+          x: root.x + item.x,
+          y: root.y + item.y,
+        },
+      ]),
+    );
     const result = detachNode(root, targetId);
     if (!result) return;
 
-    const detachedSize = getNodeSize(result.detached);
-    result.remaining.x = root.x;
-    result.remaining.y = root.y;
-    result.detached.x = root.x + getNodeSize(result.remaining).width + 36;
-    result.detached.y = Math.min(
-      root.y + 52,
-      (canvasRef.current?.clientHeight ?? 900) - detachedSize.height - 8,
-    );
+    const remainingPosition = originalPositions.get(result.remaining.id);
+    const detachedPosition = originalPositions.get(result.detached.id);
+    if (!remainingPosition || !detachedPosition) return;
 
-    if (canvasRef.current) {
-      result.detached.x = Math.max(
-        8,
-        Math.min(
-          result.detached.x,
-          canvasRef.current.clientWidth - detachedSize.width - 8,
-        ),
-      );
-    }
+    const remainingSize = getNodeSize(result.remaining);
+    const detachedSize = getNodeSize(result.detached);
+
+    // Preserve both resulting roots at their exact pre-detach canvas points.
+    result.remaining.x = remainingPosition.x - remainingSize.width / 2;
+    result.remaining.y = remainingPosition.y - 24;
+    result.detached.x = detachedPosition.x - detachedSize.width / 2;
+    result.detached.y = detachedPosition.y - 24;
 
     updateNodes([
       ...nodesRef.current.filter((node) => node.id !== root.id),
@@ -713,6 +985,34 @@ export default function MergeWorkspace() {
     setMergeCandidate(null);
     setMessage("Expression detached. The associated feature check was undone.");
   }
+
+  function handleDelete(nodeId: string) {
+    const index = nodesRef.current.findIndex((item) => item.id === nodeId);
+    if (index < 0) return;
+    const node = nodesRef.current[index];
+    setLastDeleted({ node, index });
+    updateNodes(nodesRef.current.filter((item) => item.id !== nodeId));
+    setMergeCandidate(null);
+    setMessage(`${node.label ?? node.spelling} removed from the canvas.`);
+  }
+
+  function handleUndoDelete() {
+    if (!lastDeleted) return;
+    const nextNodes = [...nodesRef.current];
+    nextNodes.splice(
+      Math.min(lastDeleted.index, nextNodes.length),
+      0,
+      lastDeleted.node,
+    );
+    updateNodes(nextNodes);
+    setLastDeleted(null);
+    setMessage(null);
+  }
+
+  const canUndoDelete =
+    lastDeleted &&
+    message ===
+      `${lastDeleted.node.label ?? lastDeleted.node.spelling} removed from the canvas.`;
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -726,8 +1026,18 @@ export default function MergeWorkspace() {
       spelling: trimmedSpelling,
       category,
       features: [
-        { value: category, checked: false },
-        ...extraFeatures.map((value) => ({ value, checked: false })),
+        {
+          value: category,
+          checked: false,
+          interpretable: true,
+          kind: "category" as const,
+        },
+        ...extraFeatures.map((value) => ({
+          value,
+          checked: false,
+          interpretable: false,
+          kind: "c-selectional" as const,
+        })),
       ],
       x: 100 + (offset % 440),
       y: 140 + (offset % 260),
@@ -753,7 +1063,7 @@ export default function MergeWorkspace() {
             <h1>Merge Lab</h1>
           </div>
           <p className="instruction">
-            Drag to Merge. Hover over a leaf or root daughter to detach it.
+            Drag to Merge. Hover over a root daughter to detach it.
           </p>
         </header>
 
@@ -770,8 +1080,41 @@ export default function MergeWorkspace() {
               node={node}
               onDetach={(targetId) => handleDetach(node, targetId)}
             />
+            {(() => {
+              const activeFeatures = getActiveUninterpretableFeatures(node);
+              const hasFullInterpretation = activeFeatures.length === 0;
+              return (
+                <div
+                  className={`interpretation-status ${
+                    hasFullInterpretation ? "complete" : "incomplete"
+                  }`}
+                  style={{ top: getNodeSize(node).height + 4 }}
+                  title={
+                    hasFullInterpretation
+                      ? "No active uninterpretable features remain."
+                      : "Active uninterpretable features remain in this structure."
+                  }
+                >
+                  {hasFullInterpretation
+                    ? "Full Interpretation"
+                    : `Uninterpretable: ${activeFeatures
+                        .map((feature) => feature.value)
+                        .join(", ")}`}
+                </div>
+              );
+            })()}
           </div>
         ))}
+
+        {draggingNodeId && (
+          <div
+            className={`trash-drop-zone ${isOverTrash ? "active" : ""}`}
+            aria-label="Drop here to remove from canvas"
+          >
+            <TrashIcon />
+            <span>{isOverTrash ? "Release to remove" : "Remove"}</span>
+          </div>
+        )}
 
         {mergeCandidate?.isValid && (
           <div
@@ -781,6 +1124,8 @@ export default function MergeWorkspace() {
                 mergeCandidate.node.x +
                 getNodeSize(mergeCandidate.node).width / 2,
               top: mergeCandidate.node.y + 24,
+              width: mergeCandidate.radius * 2,
+              height: mergeCandidate.radius * 2,
             }}
             aria-hidden="true"
           />
@@ -793,8 +1138,18 @@ export default function MergeWorkspace() {
         )}
 
         {message && (
-          <div className="status-message" role="status">
-            {message}
+          <div
+            className={`status-message ${
+              message.includes("warning:") ? "warning" : ""
+            }`}
+            role={message.includes("warning:") ? "alert" : "status"}
+          >
+            <span>{message}</span>
+            {canUndoDelete && (
+              <button type="button" onClick={handleUndoDelete}>
+                Undo
+              </button>
+            )}
           </div>
         )}
 
